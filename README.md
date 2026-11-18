@@ -113,6 +113,9 @@ If it's not correct, update with:
 
 ## Install ipkg
 
+> **Note:** `ipkg.nslu2-linux.org` is no longer reliably online. If the `wget` below fails, see
+> [nslu2-linux.org is gone: installing from the Wayback Machine](#nslu2-linuxorg-is-gone-installing-from-the-wayback-machine-and-keeping-nfs-alive).
+
 Install `ipkg` like so:
 
     cd /tmp
@@ -190,6 +193,108 @@ If NFS service is not started automatically when boots, add a last sleep line in
 
     # If you no wait, the processes die
     sleep 5
+
+## nslu2-linux.org is gone: installing from the Wayback Machine (and keeping NFS alive)
+
+The Optware feed this guide downloads from (`ipkg.nslu2-linux.org`) has gone offline,
+so `wget .../lspro-bootstrap_1.2-7_arm.xsh` and `ipkg update` / `ipkg install` no longer work
+reliably. The packages are still in the Internet Archive's Wayback Machine. The steps below
+fetch them once, keep them on the NAS, and install everything offline. A small hook then
+rebuilds NFS by itself after the NAS reboots.
+
+Tested on a LinkStation (firmware 1.75, kernel 3.3.4, armv5tel) with `unfs3 0.9.22-1`.
+
+### 1. Download the packages (on any Linux/macOS machine)
+
+Use [`scripts/fetch-packages.sh`](scripts/fetch-packages.sh). It downloads the bootstrap and the
+packages from the Wayback Machine, retries when the archive answers `503`, and checks every
+file against known-good md5 sums:
+
+    ./scripts/fetch-packages.sh                  # bootstrap + portmap + unfs3 (all NFS needs)
+    WITH_EXTRAS=1 ./scripts/fetch-packages.sh    # also openssh and nmap with their dependencies
+
+NFS needs only two packages, and neither has dependencies:
+
+| Package | Needed for | md5 |
+|---|---|---|
+| `lspro-bootstrap_1.2-7_arm.xsh` | `ipkg` itself | `bf797392071a5e49e4b9aed6513e27f8` |
+| `portmap_4-5_arm.ipk` | NFS | `7a6557171b081dce392744705fbfbdd6` |
+| `unfs3_0.9.22-1_arm.ipk` | NFS | `7b7c9efe7431f327cc88213f85e3ed1a` |
+| `openssh_5.9p1-1_arm.ipk` (+ `openssl`, `zlib`) | optional | see script |
+| `nmap_5.35DC1-3_arm.ipk` (+ `libpcap`, `openssl`, `pcre`, `libstdc++`, `lua`, `readline`, `ncurses`) | optional | see script |
+
+The Wayback URLs have this form (`id_` returns the original file unmodified):
+
+    http://web.archive.org/web/20250716190531id_/http://ipkg.nslu2-linux.org/feeds/optware/cs05q3armel/cross/stable/unfs3_0.9.22-1_arm.ipk
+
+### 2. Copy them to the NAS
+
+    scp -r buffalo root@<nas-ip>:/root/
+
+Keeping the packages on the NAS (not on another server) means the NAS can reinstall
+everything on its own, even if nothing else on the network is up.
+
+### 3. Install and start NFS offline
+
+Copy [`scripts/nfs-setup.sh`](scripts/nfs-setup.sh) to `/root/nfs-setup.sh` on the NAS, edit the
+exports for your shares and LAN, and run it:
+
+    chmod +x /root/nfs-setup.sh
+    /root/nfs-setup.sh
+
+It runs the bootstrap only if `ipkg` is missing, installs every local `.ipk`
+(`ipkg install /root/buffalo/*.ipk`), writes `/opt/etc/exports`, and starts `S55portmap` and then
+`S56unfsd`. It is safe to run again at any time.
+
+> **Gotcha:** every path in `/opt/etc/exports` must exist. If one doesn't (for example after
+> renaming a share in the Buffalo web UI), `unfsd` **fails without any error message**.
+> Check with `showmount -e <nas-ip>` from another machine.
+
+### 4. Bring NFS back automatically after a reboot
+
+On these units NFS often does not come back after a reboot or power cut (see
+*Troubleshooting with NFS* above). Instead of relying on boot scripts, append
+[`scripts/bashrc-snippet.sh`](scripts/bashrc-snippet.sh) to `/root/.bashrc` on the NAS:
+
+    if ! ps | grep -q '[u]nfsd'; then
+       echo "NFS not running, setting up..."
+       ~/nfs-setup.sh
+    fi
+
+Now any root login that finds `unfsd` missing rebuilds NFS. That includes an interactive SSH
+session or a non-interactive `ssh root@nas <command>`, because bash reads `.bashrc` for SSH
+commands. If you already poll the NAS over SSH from another machine (a cron job or a dashboard
+or monitoring script), that poll is the trigger: NFS returns within one poll interval of the NAS
+booting, with nothing to remember. For example, from a Linux box's crontab:
+
+    */5 * * * * ssh -o BatchMode=yes root@<nas-ip> true
+
+### Tip: SSH into the NAS from a modern Linux client
+
+The NAS runs an old OpenSSH that only offers `diffie-hellman-group1-sha1` and a 1024-bit RSA host key,
+both of which current distributions (e.g. Fedora) refuse by default. In `~/.ssh/config`:
+
+    Host buffalo-nas
+        HostName <nas-ip>
+        User root
+        KexAlgorithms +diffie-hellman-group1-sha1
+        HostKeyAlgorithms +ssh-rsa
+        PubkeyAcceptedKeyTypes +ssh-rsa
+        RequiredRSASize 1024
+
+On Fedora/RHEL the system crypto policy also blocks SHA-1 inside OpenSSL ("error in libcrypto").
+Allow it for this one command instead of system-wide, with a small OpenSSL config:
+
+    # ~/.config/buffalo-nas/openssl-sha1.cnf
+    openssl_conf = default_conf
+
+    [default_conf]
+    alg_section = evp_properties
+
+    [evp_properties]
+    rh-allow-sha1-signatures = yes
+
+    OPENSSL_CONF=~/.config/buffalo-nas/openssl-sha1.cnf ssh buffalo-nas
 
 ## Testing NFS
 
