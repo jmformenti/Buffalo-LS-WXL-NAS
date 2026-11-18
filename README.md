@@ -199,7 +199,7 @@ If NFS service is not started automatically when boots, add a last sleep line in
 The Optware feed this guide downloads from (`ipkg.nslu2-linux.org`) has gone offline,
 so `wget .../lspro-bootstrap_1.2-7_arm.xsh` and `ipkg update` / `ipkg install` no longer work
 reliably. The packages are still in the Internet Archive's Wayback Machine. The steps below
-fetch them once, keep them on the NAS, and install everything offline. A small hook then
+fetch them once, keep them on the NAS, and install everything offline. A cron job then
 rebuilds NFS by itself after the NAS reboots.
 
 Tested on a LinkStation (firmware 1.75, kernel 3.3.4, armv5tel) with `unfs3 0.9.22-1`.
@@ -252,22 +252,26 @@ It runs the bootstrap only if `ipkg` is missing, installs every local `.ipk`
 
 ### 4. Bring NFS back automatically after a reboot
 
-On these units NFS often does not come back after a reboot or power cut (see
-*Troubleshooting with NFS* above). Instead of relying on boot scripts, append
-[`scripts/bashrc-snippet.sh`](scripts/bashrc-snippet.sh) to `/root/.bashrc` on the NAS:
+On these units NFS often does not survive a reboot or power cut, even though the firmware's
+`rcS` runs `rc.optware` and so `S55portmap`/`S56unfsd` at boot (see *Troubleshooting with NFS*
+above). Instead of relying on that, let cron check every minute and rebuild NFS when `unfsd` isn't
+running. Copy [`scripts/nfs-check.sh`](scripts/nfs-check.sh) to `/root/nfs-check.sh` and add it to
+root's crontab:
 
-    if ! ps | grep -q '[u]nfsd'; then
-       echo "NFS not running, setting up..."
-       ~/nfs-setup.sh
-    fi
+    chmod +x /root/nfs-check.sh
+    crontab -l > /tmp/ct && echo '* * * * * /bin/sh /root/nfs-check.sh' >> /tmp/ct && crontab /tmp/ct
 
-Now any root login that finds `unfsd` missing rebuilds NFS. That includes an interactive SSH
-session or a non-interactive `ssh root@nas <command>`, because bash reads `.bashrc` for SSH
-commands. If you already poll the NAS over SSH from another machine (a cron job or a dashboard
-or monitoring script), that poll is the trigger: NFS returns within one poll interval of the NAS
-booting, with nothing to remember. For example, from a Linux box's crontab:
+NFS is then back within about a minute of the NAS booting, with no other machine involved.
+When it has to act, it logs to syslog (`nfs-check`) and to `/root/nfs-check.log`.
+`/tmp/nfs-check.last` is touched on every run, so you can confirm cron is calling it.
 
-    */5 * * * * ssh -o BatchMode=yes root@<nas-ip> true
+> **Gotchas:**
+> - `@reboot` does **not** work here. The firmware's crond is BusyBox 1.7 (2009), which predates
+>   `@reboot` support, so the line is silently ignored.
+> - cron runs with a minimal `PATH`. The script sets its own, so `ipkg`, `killall`, `pidof` and the
+>   `/opt/etc/init.d` scripts are all found.
+> - The Buffalo firmware may rewrite root's crontab when settings are changed in its web UI (unconfirmed).
+>   If NFS stops coming back after a reboot, check `crontab -l` first.
 
 ### Tip: SSH into the NAS from a modern Linux client
 
